@@ -14,6 +14,9 @@ dependencies = [
     "sqlite-vec>=0.1.6",
 ]
 
+[project.scripts]
+afm-rag = "afm_rag.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
