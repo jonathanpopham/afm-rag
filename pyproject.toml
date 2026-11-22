@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "afm-rag"
+version = "0.1.0"
+description = "Local RAG system for Army Field Manuals using Ollama and SQLite"
+license = { file = "LICENSE" }
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "httpx>=0.28",
+    "numpy>=2.0",
+    "sqlite-vec>=0.1.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/afm_rag"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
