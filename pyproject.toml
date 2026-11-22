@@ -10,12 +10,14 @@ license = { file = "LICENSE" }
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "httpx>=0.28",
+    "mcp>=2.0",
     "numpy>=2.0",
     "sqlite-vec>=0.1.6",
 ]
 
 [project.scripts]
 afm-rag = "afm_rag.cli:main"
+afm-rag-mcp = "afm_rag.mcp_server:main"
 
 [dependency-groups]
 dev = [

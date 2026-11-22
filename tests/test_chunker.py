@@ -69,11 +69,7 @@ def test_split_sections_handles_preamble_before_first_heading() -> None:
 
 def test_split_sections_skips_empty_container_headings() -> None:
     """Verify empty parent headings do not produce empty section records."""
-    markdown = (
-        "# Chapter 1\n"
-        "## Section 1.1\n"
-        "Body text for section 1.1.\n"
-    )
+    markdown = "# Chapter 1\n## Section 1.1\nBody text for section 1.1.\n"
 
     sections = split_markdown_sections(markdown)
 

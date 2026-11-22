@@ -5,6 +5,7 @@ from afm_rag.embeddings import OllamaEmbedder, cosine_similarity, rank_top_k
 from afm_rag.eval import EvalCase, evaluate_retrieval
 from afm_rag.generator import OllamaGenerator, RagAnswer, build_grounded_messages
 from afm_rag.loader import iter_vault_zip_manuals, load_markdown_dir
+from afm_rag.mcp_server import create_mcp_server
 from afm_rag.models import (
     ManualDocument,
     SearchResult,
@@ -27,6 +28,7 @@ __all__ = [
     "build_grounded_messages",
     "chunk_document",
     "cosine_similarity",
+    "create_mcp_server",
     "evaluate_retrieval",
     "format_chunk_for_embedding",
     "ingest_path",
