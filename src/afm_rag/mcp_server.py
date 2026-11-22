@@ -47,7 +47,7 @@ def create_mcp_server(
 
     @server.tool()
     def index_stats() -> dict[str, object]:
-        """Return counts of indexed manuals, chunks, and categories."""
+        """Return counts of indexed manuals, chunks, categories, and statuses."""
         if not resolved_db.is_file():
             return _missing_db_payload(resolved_db)
 
@@ -58,9 +58,10 @@ def create_mcp_server(
     def list_manuals(
         category: str | None = None,
         subcategory: str | None = None,
+        status: str | None = None,
         limit: int = 50,
     ) -> dict[str, object]:
-        """List indexed field manuals filtered optionally by category and subcategory."""
+        """List indexed field manuals filtered by category, subcategory, and status."""
         if not resolved_db.is_file():
             return _missing_db_payload(resolved_db)
 
@@ -68,6 +69,7 @@ def create_mcp_server(
             manuals = store.list_manuals(
                 category=category,
                 subcategory=subcategory,
+                status=status,
                 limit=limit,
             )
         return {"manuals": manuals, "count": len(manuals)}
@@ -78,6 +80,7 @@ def create_mcp_server(
         top_k: int = 5,
         category: str | None = None,
         subcategory: str | None = None,
+        status: str | None = None,
     ) -> dict[str, object]:
         """Run hybrid vector and FTS5 keyword search across indexed field manuals."""
         if not resolved_db.is_file():
@@ -89,7 +92,11 @@ def create_mcp_server(
                 embedder
                 if embedder is not None
                 else stack.enter_context(
-                    OllamaEmbedder(model=resolved_model, base_url=resolved_url)
+                    OllamaEmbedder(
+                        model=resolved_model,
+                        base_url=resolved_url,
+                        dimensions=resolved_dims,
+                    )
                 )
             )
             query_vec = active_embedder.embed_query(query)
@@ -99,6 +106,7 @@ def create_mcp_server(
                 top_k=top_k,
                 category=category,
                 subcategory=subcategory,
+                status=status,
             )
 
         items = [
@@ -106,6 +114,9 @@ def create_mcp_server(
                 "chunk_id": hit.chunk.chunk_id,
                 "doc_id": hit.chunk.doc_id,
                 "title": hit.chunk.title,
+                "designation": hit.chunk.designation,
+                "status": hit.chunk.status,
+                "edition_date": hit.chunk.edition_date,
                 "category": hit.chunk.category,
                 "subcategory": hit.chunk.subcategory,
                 "section_path": hit.chunk.section_path,
@@ -140,6 +151,9 @@ def create_mcp_server(
                 "chunk_id": chunk.chunk_id,
                 "chunk_index": chunk.chunk_index,
                 "section_path": chunk.section_path,
+                "status": chunk.status,
+                "designation": chunk.designation,
+                "edition_date": chunk.edition_date,
                 "text": chunk.text,
             }
             for chunk in chunks

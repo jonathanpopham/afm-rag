@@ -12,6 +12,7 @@ from typing import Self
 import numpy as np
 import sqlite_vec
 
+from afm_rag.embeddings import DEFAULT_EMBED_DIMS
 from afm_rag.models import ManualDocument, SearchResult, TextChunk
 
 STOP_WORDS = frozenset(
@@ -94,25 +95,47 @@ def reciprocal_rank_fusion(
     return sorted(scores.items(), key=lambda item: (-item[1], item[0]))
 
 
+def _row_to_chunk(row: sqlite3.Row) -> TextChunk:
+    """Convert one SQLite row into a TextChunk record."""
+    return TextChunk(
+        chunk_id=str(row["chunk_id"]),
+        doc_id=str(row["doc_id"]),
+        title=str(row["title"]),
+        category=str(row["category"]),
+        subcategory=str(row["subcategory"]),
+        section_path=str(row["section_path"]),
+        chunk_index=int(row["chunk_index"]),
+        text=str(row["text"]),
+        status=str(row["status"]),
+        branch=str(row["branch"]),
+        designation=str(row["designation"]),
+        edition_date=str(row["edition_date"]),
+    )
+
+
 class HybridStore:
     """SQLite storage engine supporting vector KNN, FTS5 keyword search, and RRF."""
 
-    def __init__(self, db_path: Path | str, embedding_dims: int = 1024) -> None:
+    def __init__(
+        self,
+        db_path: Path | str,
+        embedding_dims: int | None = DEFAULT_EMBED_DIMS,
+    ) -> None:
         """Open or initialize the hybrid SQLite database and virtual tables."""
-        if embedding_dims <= 0:
+        if embedding_dims is not None and embedding_dims <= 0:
             raise ValueError("embedding_dims must be positive.")
 
         self.db_path = str(db_path)
-        self.embedding_dims = embedding_dims
-
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout = 30000")
 
         if self.db_path != ":memory:":
             self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.execute("PRAGMA foreign_keys = ON")
 
         self.conn.enable_load_extension(True)
@@ -121,19 +144,49 @@ class HybridStore:
         finally:
             self.conn.enable_load_extension(False)
 
+        self.embedding_dims = self._resolve_embedding_dims(embedding_dims)
         self._create_schema()
+
+    def _resolve_embedding_dims(self, requested_dims: int | None) -> int:
+        """Validate requested vector dimensions against existing database metadata."""
+        has_meta = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+        ).fetchone()
+        stored_dims: int | None = None
+        if has_meta is not None:
+            row = self.conn.execute(
+                "SELECT value FROM meta WHERE key = 'embedding_dims'"
+            ).fetchone()
+            if row is not None:
+                stored_dims = int(row["value"])
+
+        if requested_dims is None:
+            return stored_dims if stored_dims is not None else DEFAULT_EMBED_DIMS
+
+        if stored_dims is not None and stored_dims != requested_dims:
+            raise ValueError(f"Database uses {stored_dims} embedding dims, got {requested_dims}.")
+        return requested_dims
 
     def _create_schema(self) -> None:
         """Create core tables, indexes, and virtual tables when missing."""
         with self.conn:
             self.conn.executescript(
                 f"""
+                CREATE TABLE IF NOT EXISTS meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS manuals (
                     doc_id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     category TEXT NOT NULL,
                     subcategory TEXT NOT NULL,
                     source_path TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    branch TEXT NOT NULL DEFAULT '',
+                    designation TEXT NOT NULL DEFAULT '',
+                    edition_date TEXT NOT NULL DEFAULT '',
                     content_sha256 TEXT NOT NULL,
                     chunk_count INTEGER NOT NULL,
                     indexed_at TEXT NOT NULL
@@ -148,14 +201,22 @@ class HybridStore:
                     subcategory TEXT NOT NULL,
                     section_path TEXT NOT NULL,
                     chunk_index INTEGER NOT NULL,
-                    text TEXT NOT NULL
+                    text TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    branch TEXT NOT NULL DEFAULT '',
+                    designation TEXT NOT NULL DEFAULT '',
+                    edition_date TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id);
                 CREATE INDEX IF NOT EXISTS idx_chunks_category ON chunks(category, subcategory);
+                CREATE INDEX IF NOT EXISTS idx_chunks_status ON chunks(status);
 
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
                     chunk_rowid INTEGER PRIMARY KEY,
+                    status text,
+                    category text,
+                    subcategory text,
                     embedding float[{self.embedding_dims}] distance_metric=cosine
                 );
 
@@ -166,6 +227,10 @@ class HybridStore:
                     tokenize='porter unicode61'
                 );
                 """
+            )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('embedding_dims', ?)",
+                (str(self.embedding_dims),),
             )
 
     def __enter__(self) -> Self:
@@ -240,8 +305,9 @@ class HybridStore:
                 """
                 INSERT INTO manuals (
                     doc_id, title, category, subcategory, source_path,
+                    status, branch, designation, edition_date,
                     content_sha256, chunk_count, indexed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     doc.doc_id,
@@ -249,6 +315,10 @@ class HybridStore:
                     doc.category,
                     doc.subcategory,
                     doc.source_path,
+                    doc.status,
+                    doc.branch,
+                    doc.designation,
+                    doc.edition_date,
                     digest,
                     len(chunks),
                     indexed_at,
@@ -260,8 +330,9 @@ class HybridStore:
                     """
                     INSERT INTO chunks (
                         chunk_id, doc_id, title, category, subcategory,
-                        section_path, chunk_index, text
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        section_path, chunk_index, text,
+                        status, branch, designation, edition_date
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         chunk.chunk_id,
@@ -272,12 +343,26 @@ class HybridStore:
                         chunk.section_path,
                         chunk.chunk_index,
                         chunk.text,
+                        chunk.status,
+                        chunk.branch,
+                        chunk.designation,
+                        chunk.edition_date,
                     ),
                 )
                 rowid = int(cursor.lastrowid)
                 self.conn.execute(
-                    "INSERT INTO chunks_vec(chunk_rowid, embedding) VALUES (?, ?)",
-                    (rowid, sqlite_vec.serialize_float32(vector.tolist())),
+                    """
+                    INSERT INTO chunks_vec(
+                        chunk_rowid, status, category, subcategory, embedding
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rowid,
+                        chunk.status,
+                        chunk.category,
+                        chunk.subcategory,
+                        sqlite_vec.serialize_float32(vector.tolist()),
+                    ),
                 )
                 self.conn.execute(
                     "INSERT INTO chunks_fts(rowid, title, section_path, text) VALUES (?, ?, ?, ?)",
@@ -292,8 +377,9 @@ class HybridStore:
         top_k: int = 10,
         category: str | None = None,
         subcategory: str | None = None,
+        status: str | None = None,
     ) -> list[tuple[str, float]]:
-        """Run cosine KNN vector search via sqlite-vec and optional metadata filters."""
+        """Run cosine KNN vector search via sqlite-vec with native metadata filters."""
         if top_k <= 0:
             raise ValueError("top_k must be positive.")
 
@@ -305,37 +391,30 @@ class HybridStore:
         if total_chunks == 0:
             return []
 
-        # Over-fetch KNN candidates before metadata filtering so filtered results stay complete.
-        has_filter = category is not None or subcategory is not None
-        candidate_k = (
-            min(total_chunks, max(top_k * 8, 100)) if has_filter else min(total_chunks, top_k)
-        )
-
-        where_clauses: list[str] = []
-        params: list[object] = [sqlite_vec.serialize_float32(query_vec.tolist()), candidate_k]
+        k_limit = min(total_chunks, top_k)
+        vec_clauses = ["embedding MATCH ?", "k = ?"]
+        params: list[object] = [sqlite_vec.serialize_float32(query_vec.tolist()), k_limit]
+        if status is not None:
+            vec_clauses.append("status = ?")
+            params.append(status)
         if category is not None:
-            where_clauses.append("c.category = ?")
+            vec_clauses.append("category = ?")
             params.append(category)
         if subcategory is not None:
-            where_clauses.append("c.subcategory = ?")
+            vec_clauses.append("subcategory = ?")
             params.append(subcategory)
-
-        filter_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-        params.append(top_k)
 
         rows = self.conn.execute(
             f"""
             WITH vec_matches AS (
                 SELECT chunk_rowid, distance
                 FROM chunks_vec
-                WHERE embedding MATCH ? AND k = ?
+                WHERE {" AND ".join(vec_clauses)}
             )
             SELECT c.chunk_id, v.distance
             FROM vec_matches AS v
             JOIN chunks AS c ON c.rowid = v.chunk_rowid
-            {filter_sql}
             ORDER BY v.distance ASC
-            LIMIT ?
             """,
             params,
         ).fetchall()
@@ -353,6 +432,7 @@ class HybridStore:
         top_k: int = 10,
         category: str | None = None,
         subcategory: str | None = None,
+        status: str | None = None,
     ) -> list[tuple[str, float]]:
         """Run BM25 full-text search via SQLite FTS5 and optional metadata filters."""
         if top_k <= 0:
@@ -364,6 +444,9 @@ class HybridStore:
 
         where_clauses = ["chunks_fts MATCH ?"]
         params: list[object] = [fts_query]
+        if status is not None:
+            where_clauses.append("c.status = ?")
+            params.append(status)
         if category is not None:
             where_clauses.append("c.category = ?")
             params.append(category)
@@ -394,6 +477,7 @@ class HybridStore:
         top_k: int = 5,
         category: str | None = None,
         subcategory: str | None = None,
+        status: str | None = None,
         rrf_k: int = 60,
     ) -> list[SearchResult]:
         """Run vector and lexical searches, fuse via RRF, and return ranked SearchResults."""
@@ -406,12 +490,14 @@ class HybridStore:
             top_k=candidate_k,
             category=category,
             subcategory=subcategory,
+            status=status,
         )
         lex_hits = self.search_lexical(
             query,
             top_k=candidate_k,
             category=category,
             subcategory=subcategory,
+            status=status,
         )
 
         vec_ids = [chunk_id for chunk_id, _ in vec_hits]
@@ -428,26 +514,15 @@ class HybridStore:
         rows = self.conn.execute(
             f"""
             SELECT chunk_id, doc_id, title, category, subcategory,
-                   section_path, chunk_index, text
+                   section_path, chunk_index, text,
+                   status, branch, designation, edition_date
             FROM chunks
             WHERE chunk_id IN ({placeholders})
             """,
             target_ids,
         ).fetchall()
 
-        chunks_by_id = {
-            str(row["chunk_id"]): TextChunk(
-                chunk_id=str(row["chunk_id"]),
-                doc_id=str(row["doc_id"]),
-                title=str(row["title"]),
-                category=str(row["category"]),
-                subcategory=str(row["subcategory"]),
-                section_path=str(row["section_path"]),
-                chunk_index=int(row["chunk_index"]),
-                text=str(row["text"]),
-            )
-            for row in rows
-        }
+        chunks_by_id = {str(row["chunk_id"]): _row_to_chunk(row) for row in rows}
 
         return [
             SearchResult(
@@ -464,14 +539,18 @@ class HybridStore:
         self,
         category: str | None = None,
         subcategory: str | None = None,
+        status: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, object]]:
-        """List indexed manuals filtered optionally by category and subcategory."""
+        """List indexed manuals filtered optionally by category, subcategory, and status."""
         if limit <= 0:
             raise ValueError("limit must be positive.")
 
         where_clauses: list[str] = []
         params: list[object] = []
+        if status is not None:
+            where_clauses.append("status = ?")
+            params.append(status)
         if category is not None:
             where_clauses.append("category = ?")
             params.append(category)
@@ -484,7 +563,9 @@ class HybridStore:
 
         rows = self.conn.execute(
             f"""
-            SELECT doc_id, title, category, subcategory, source_path, chunk_count, indexed_at
+            SELECT doc_id, title, category, subcategory, source_path,
+                   status, branch, designation, edition_date,
+                   chunk_count, indexed_at
             FROM manuals
             {where_sql}
             ORDER BY category ASC, subcategory ASC, title ASC
@@ -500,6 +581,10 @@ class HybridStore:
                 "category": str(row["category"]),
                 "subcategory": str(row["subcategory"]),
                 "source_path": str(row["source_path"]),
+                "status": str(row["status"]),
+                "branch": str(row["branch"]),
+                "designation": str(row["designation"]),
+                "edition_date": str(row["edition_date"]),
                 "chunk_count": int(row["chunk_count"]),
                 "indexed_at": str(row["indexed_at"]),
             }
@@ -526,7 +611,8 @@ class HybridStore:
         rows = self.conn.execute(
             f"""
             SELECT chunk_id, doc_id, title, category, subcategory,
-                   section_path, chunk_index, text
+                   section_path, chunk_index, text,
+                   status, branch, designation, edition_date
             FROM chunks
             WHERE {" AND ".join(where_clauses)}
             ORDER BY chunk_index ASC
@@ -535,30 +621,23 @@ class HybridStore:
             params,
         ).fetchall()
 
-        return [
-            TextChunk(
-                chunk_id=str(row["chunk_id"]),
-                doc_id=str(row["doc_id"]),
-                title=str(row["title"]),
-                category=str(row["category"]),
-                subcategory=str(row["subcategory"]),
-                section_path=str(row["section_path"]),
-                chunk_index=int(row["chunk_index"]),
-                text=str(row["text"]),
-            )
-            for row in rows
-        ]
+        return [_row_to_chunk(row) for row in rows]
 
     def stats(self) -> dict[str, object]:
-        """Return counts of indexed manuals, chunks, and categories."""
+        """Return counts of indexed manuals, chunks, categories, and statuses."""
         manual_count = int(self.conn.execute("SELECT COUNT(*) FROM manuals").fetchone()[0])
         chunk_count = int(self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
         category_rows = self.conn.execute(
             "SELECT category, COUNT(*) AS count FROM manuals GROUP BY category ORDER BY category ASC"
         ).fetchall()
+        status_rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS count FROM manuals GROUP BY status ORDER BY status ASC"
+        ).fetchall()
         categories = {str(row["category"]): int(row["count"]) for row in category_rows}
+        statuses = {str(row["status"]): int(row["count"]) for row in status_rows}
         return {
             "manual_count": manual_count,
             "chunk_count": chunk_count,
             "categories": categories,
+            "statuses": statuses,
         }

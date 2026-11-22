@@ -39,7 +39,7 @@ def _make_fake_embedder() -> tuple[httpx.Client, OllamaEmbedder]:
         return httpx.Response(200, json={"embeddings": vectors})
 
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://localhost:11434")
-    return client, OllamaEmbedder(batch_size=8, client=client)
+    return client, OllamaEmbedder(batch_size=8, dimensions=FAKE_DIMS, client=client)
 
 
 def test_ingest_path_skips_unchanged_and_evaluates_fixtures(tmp_path: Path) -> None:
@@ -67,6 +67,7 @@ def test_ingest_path_skips_unchanged_and_evaluates_fixtures(tmp_path: Path) -> N
         assert second_run == {
             "manuals_indexed": 0,
             "manuals_skipped": 3,
+            "manuals_failed": 0,
             "chunks_indexed": 0,
         }
 

@@ -1,4 +1,4 @@
-"""Milestone 4 tests for HybridStore, sqlite-vec KNN, FTS5, and RRF."""
+"""Milestone 4 tests for HybridStore, sqlite-vec KNN, FTS5, status filtering, and RRF."""
 
 from pathlib import Path
 
@@ -34,8 +34,8 @@ def test_reciprocal_rank_fusion_combines_and_validates() -> None:
         reciprocal_rank_fusion(["c1"], ["c1"], k=0)
 
 
-def test_hybrid_store_upsert_search_filter_and_replace(tmp_path: Path) -> None:
-    """Verify HybridStore indexing, vector/lexical/hybrid searches, filters, and replacement."""
+def test_hybrid_store_upsert_search_status_filter_and_replace(tmp_path: Path) -> None:
+    """Verify HybridStore indexing, status/category filtering, replacement, and dim checks."""
     db_path = tmp_path / "test_hybrid.db"
 
     nav_doc = ManualDocument(
@@ -45,6 +45,10 @@ def test_hybrid_store_upsert_search_filter_and_replace(tmp_path: Path) -> None:
         subcategory="Land Navigation",
         source_path="Doctrine/Land Navigation/FM_3-25.26.md",
         text="Eight-digit grid coordinate text.",
+        status="active",
+        branch="army",
+        designation="FM 3-25.26",
+        edition_date="2020-01-01",
     )
     nav_chunks = [
         TextChunk(
@@ -56,6 +60,10 @@ def test_hybrid_store_upsert_search_filter_and_replace(tmp_path: Path) -> None:
             section_path="FM 3-25.26 > Grid Coordinates",
             chunk_index=0,
             text="An eight-digit grid coordinate locates a point within 10 meters.",
+            status="active",
+            branch="army",
+            designation="FM 3-25.26",
+            edition_date="2020-01-01",
         ),
         TextChunk(
             chunk_id="doctrine/nav/fm_3-25.26::chunk_0001",
@@ -66,6 +74,10 @@ def test_hybrid_store_upsert_search_filter_and_replace(tmp_path: Path) -> None:
             section_path="FM 3-25.26 > Back Azimuth",
             chunk_index=1,
             text="Add 180 degrees when the azimuth measures under 180 degrees.",
+            status="active",
+            branch="army",
+            designation="FM 3-25.26",
+            edition_date="2020-01-01",
         ),
     ]
     nav_emb = np.array(
@@ -76,52 +88,71 @@ def test_hybrid_store_upsert_search_filter_and_replace(tmp_path: Path) -> None:
         dtype=np.float32,
     )
 
-    med_doc = ManualDocument(
+    old_med_doc = ManualDocument(
         doc_id="doctrine/med/tc_4-02.1",
-        title="TC 4-02.1 First Aid",
+        title="TC 4-02.1 First Aid (Old Edition)",
         category="Medical",
         subcategory="TCCC",
         source_path="Medical/TCCC/TC_4-02.1.md",
         text="MARCH and tourniquet text.",
+        status="superseded",
+        branch="army",
+        designation="TC 4-02.1",
     )
     med_chunks = [
         TextChunk(
             chunk_id="doctrine/med/tc_4-02.1::chunk_0000",
-            doc_id=med_doc.doc_id,
-            title=med_doc.title,
-            category=med_doc.category,
-            subcategory=med_doc.subcategory,
+            doc_id=old_med_doc.doc_id,
+            title=old_med_doc.title,
+            category=old_med_doc.category,
+            subcategory=old_med_doc.subcategory,
             section_path="TC 4-02.1 > MARCH",
             chunk_index=0,
             text="Massive hemorrhage control precedes airway management.",
+            status="superseded",
+            branch="army",
+            designation="TC 4-02.1",
         ),
     ]
-    med_emb = np.array([[0.0, 0.0, 1.0, 0.0]], dtype=np.float32)
+    med_emb = np.array([[0.9, 0.1, 0.0, 0.0]], dtype=np.float32)
 
     with HybridStore(db_path, embedding_dims=4) as store:
         assert store.upsert_manual(nav_doc, nav_chunks, nav_emb) == 2
-        assert store.upsert_manual(med_doc, med_chunks, med_emb) == 1
+        assert store.upsert_manual(old_med_doc, med_chunks, med_emb) == 1
 
         stats = store.stats()
         assert stats == {
             "manual_count": 2,
             "chunk_count": 3,
             "categories": {"Doctrine": 1, "Medical": 1},
+            "statuses": {"active": 1, "superseded": 1},
         }
         assert store.has_manual_hash(nav_doc.doc_id, compute_sha256(nav_doc.text))
         assert not store.has_manual_hash(nav_doc.doc_id, "wrong_sha")
 
         manuals = store.list_manuals(category="Medical")
         assert len(manuals) == 1
-        assert manuals[0]["doc_id"] == med_doc.doc_id
+        assert manuals[0]["doc_id"] == old_med_doc.doc_id
+        assert manuals[0]["status"] == "superseded"
+
+        active_manuals = store.list_manuals(status="active")
+        assert [m["doc_id"] for m in active_manuals] == [nav_doc.doc_id]
 
         section_chunks = store.get_section(nav_doc.doc_id, section_query="azimuth")
         assert len(section_chunks) == 1
         assert section_chunks[0].chunk_id == nav_chunks[1].chunk_id
+        assert section_chunks[0].status == "active"
 
         vec_hits = store.search_vector(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), top_k=2)
         assert vec_hits[0][0] == nav_chunks[0].chunk_id
         assert vec_hits[0][1] == pytest.approx(1.0, abs=1e-5)
+
+        superseded_vec_hits = store.search_vector(
+            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            top_k=2,
+            status="superseded",
+        )
+        assert [cid for cid, _ in superseded_vec_hits] == [med_chunks[0].chunk_id]
 
         lex_hits = store.search_lexical("hemorrhage tourniquet", top_k=2)
         assert lex_hits[0][0] == med_chunks[0].chunk_id
@@ -135,14 +166,13 @@ def test_hybrid_store_upsert_search_filter_and_replace(tmp_path: Path) -> None:
         assert hybrid_hits[0].vector_rank == 1
         assert hybrid_hits[0].lexical_rank == 1
 
-        filtered_hits = store.search_hybrid(
-            "eight-digit grid",
-            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        active_only_hits = store.search_hybrid(
+            "hemorrhage",
+            np.array([0.9, 0.1, 0.0, 0.0], dtype=np.float32),
             top_k=3,
-            category="Medical",
+            status="active",
         )
-        assert len(filtered_hits) == 1
-        assert filtered_hits[0].chunk.category == "Medical"
+        assert all(hit.chunk.status == "active" for hit in active_only_hits)
 
         # Re-upserting the same doc_id must cleanly replace existing rows across all tables.
         updated_doc = ManualDocument(
@@ -152,6 +182,7 @@ def test_hybrid_store_upsert_search_filter_and_replace(tmp_path: Path) -> None:
             subcategory=nav_doc.subcategory,
             source_path=nav_doc.source_path,
             text="Updated navigation text.",
+            status="active",
         )
         updated_chunk = [
             TextChunk(
@@ -163,6 +194,7 @@ def test_hybrid_store_upsert_search_filter_and_replace(tmp_path: Path) -> None:
                 section_path="FM 3-25.26 > Updated",
                 chunk_index=0,
                 text="Updated ridge contour reference.",
+                status="active",
             )
         ]
         updated_emb = np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
@@ -173,3 +205,10 @@ def test_hybrid_store_upsert_search_filter_and_replace(tmp_path: Path) -> None:
         fts_count = store.conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
         assert vec_count == 2
         assert fts_count == 2
+
+    # Opening an existing DB with auto-detected dims succeeds, while mismatched dims raises ValueError.
+    with HybridStore(db_path, embedding_dims=None) as auto_store:
+        assert auto_store.embedding_dims == 4
+
+    with pytest.raises(ValueError, match="embedding dims"):
+        HybridStore(db_path, embedding_dims=512)

@@ -39,7 +39,7 @@ def _make_fake_embedder() -> tuple[httpx.Client, OllamaEmbedder]:
         return httpx.Response(200, json={"embeddings": vectors})
 
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://localhost:11434")
-    return client, OllamaEmbedder(batch_size=8, client=client)
+    return client, OllamaEmbedder(batch_size=8, dimensions=FAKE_DIMS, client=client)
 
 
 def test_mcp_server_registers_and_executes_all_tools(tmp_path: Path) -> None:
@@ -83,6 +83,15 @@ def test_mcp_server_registers_and_executes_all_tools(tmp_path: Path) -> None:
             assert search_res.structured_content["count"] >= 1
             top_hit = search_res.structured_content["results"][0]
             assert "fm_3-25.26" in top_hit["doc_id"]
+            assert top_hit["status"] == "unknown"
+
+            active_search = await server.call_tool(
+                "search_manuals",
+                {"query": "eight-digit grid coordinate", "top_k": 3, "status": "active"},
+            )
+            assert active_search.is_error is False
+            assert active_search.structured_content is not None
+            assert active_search.structured_content["count"] == 0
 
             section_res = await server.call_tool(
                 "read_manual_section",

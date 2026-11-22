@@ -1,5 +1,6 @@
 """Local Ollama embedding client and NumPy cosine similarity utilities."""
 
+import time
 from collections.abc import Sequence
 from types import TracebackType
 from typing import Self
@@ -9,7 +10,7 @@ import numpy as np
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "qwen3-embedding:0.6b"
-DEFAULT_EMBED_DIMS = 1024
+DEFAULT_EMBED_DIMS = 512
 
 
 def cosine_similarity(query_vec: np.ndarray, doc_matrix: np.ndarray) -> np.ndarray:
@@ -69,17 +70,25 @@ class OllamaEmbedder:
         self,
         model: str = DEFAULT_EMBED_MODEL,
         base_url: str = DEFAULT_OLLAMA_URL,
-        batch_size: int = 32,
+        batch_size: int = 64,
+        dimensions: int | None = DEFAULT_EMBED_DIMS,
+        max_retries: int = 3,
         timeout: float = 120.0,
         client: httpx.Client | None = None,
     ) -> None:
-        """Initialize the Ollama embedder with batching and HTTP lifecycle settings."""
+        """Initialize the Ollama embedder with batching, MRL dims, and retry settings."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
+        if dimensions is not None and dimensions <= 0:
+            raise ValueError("dimensions must be positive.")
+        if max_retries <= 0:
+            raise ValueError("max_retries must be positive.")
 
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.batch_size = batch_size
+        self.dimensions = dimensions
+        self.max_retries = max_retries
         self._owns_client = client is None
         self._client = (
             client if client is not None else httpx.Client(base_url=self.base_url, timeout=timeout)
@@ -103,6 +112,31 @@ class OllamaEmbedder:
         if self._owns_client:
             self._client.close()
 
+    def _post_embed_with_retry(self, endpoint: str, batch: list[str]) -> list[list[float]]:
+        """Send one /api/embed request with retries on transient transport or 5xx errors."""
+        payload: dict[str, object] = {"model": self.model, "input": batch}
+        if self.dimensions is not None:
+            payload["dimensions"] = self.dimensions
+
+        for attempt in range(self.max_retries):
+            try:
+                response = self._client.post(endpoint, json=payload)
+                if response.status_code >= 500 and attempt < self.max_retries - 1:
+                    time.sleep(float(2**attempt))
+                    continue
+                response.raise_for_status()
+                body = response.json()
+                vectors = body.get("embeddings")
+                if not isinstance(vectors, list) or len(vectors) != len(batch):
+                    raise ValueError("Ollama /api/embed returned an unexpected embeddings count.")
+                return vectors
+            except httpx.TransportError:
+                if attempt >= self.max_retries - 1:
+                    raise
+                time.sleep(float(2**attempt))
+
+        raise RuntimeError("Unreachable retry state in _post_embed_with_retry.")
+
     def embed_texts(self, texts: Sequence[str]) -> np.ndarray:
         """Embed a sequence of text strings in batches and return a float32 matrix."""
         if not texts:
@@ -113,15 +147,7 @@ class OllamaEmbedder:
 
         for start in range(0, len(texts), self.batch_size):
             batch = list(texts[start : start + self.batch_size])
-            response = self._client.post(
-                endpoint,
-                json={"model": self.model, "input": batch},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            vectors = payload.get("embeddings")
-            if not isinstance(vectors, list) or len(vectors) != len(batch):
-                raise ValueError("Ollama /api/embed returned an unexpected embeddings count.")
+            vectors = self._post_embed_with_retry(endpoint, batch)
             batches.append(np.asarray(vectors, dtype=np.float32))
 
         return np.vstack(batches).astype(np.float32, copy=False)

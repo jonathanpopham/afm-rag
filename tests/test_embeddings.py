@@ -83,14 +83,25 @@ def test_rank_top_k_sorts_clamps_and_validates() -> None:
         rank_top_k(query, docs, top_k=0)
 
 
-def test_ollama_embedder_batches_requests_via_mock_transport() -> None:
-    """Verify OllamaEmbedder splits inputs by batch_size and returns a float32 matrix."""
+def test_ollama_embedder_batches_requests_and_retries_via_mock_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify OllamaEmbedder sends dimensions, batches inputs, and retries transient 500 errors."""
+    monkeypatch.setattr("afm_rag.embeddings.time.sleep", lambda _: None)
     recorded_batches: list[list[str]] = []
+    attempts = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
         assert request.url.path == "/api/embed"
         body = json.loads(request.content.decode("utf-8"))
         assert body["model"] == "qwen3-embedding:0.6b"
+        assert body["dimensions"] == 512
+
+        if attempts == 1:
+            return httpx.Response(503, json={"error": "loading model"})
+
         batch_inputs = body["input"]
         recorded_batches.append(batch_inputs)
 
@@ -101,10 +112,11 @@ def test_ollama_embedder_batches_requests_via_mock_transport() -> None:
 
     transport = httpx.MockTransport(handler)
     with httpx.Client(transport=transport, base_url="http://localhost:11434") as client:
-        embedder = OllamaEmbedder(batch_size=2, client=client)
+        embedder = OllamaEmbedder(batch_size=2, dimensions=512, max_retries=3, client=client)
         matrix = embedder.embed_texts(["a", "bb", "ccc", "dddd", "eeeee"])
         query_vec = embedder.embed_query("grid")
 
+    assert attempts == 5
     assert recorded_batches == [["a", "bb"], ["ccc", "dddd"], ["eeeee"], ["grid"]]
     assert matrix.shape == (5, 4)
     assert matrix.dtype == np.float32

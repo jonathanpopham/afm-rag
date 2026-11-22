@@ -133,6 +133,10 @@ def chunk_document(
                     section_path=section_path,
                     chunk_index=chunk_index,
                     text=piece,
+                    status=doc.status,
+                    branch=doc.branch,
+                    designation=doc.designation,
+                    edition_date=doc.edition_date,
                 )
             )
 
